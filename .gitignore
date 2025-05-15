@@ -1,3 +1,5 @@
 env/
 CVSS.pdf
 chroma_db/
+node_modules/
+.env

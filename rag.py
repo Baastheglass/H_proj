@@ -6,23 +6,33 @@ from langchain_chroma import Chroma
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 import os
+import tempfile
+
+app = Flask(__name__)
+CORS(app)
 
 # Define paths
 persist_directory = "./chroma_db"
-pdf_path = "CVSS.pdf"
+UPLOAD_FOLDER = './uploads'
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # Global variables to store the chain and retriever
 _rag_chain = None
 _retriever = None
+_current_pdf = None
 
-def setup_db(force_reload=False):
+def setup_db(pdf_path, force_reload=False):
     """
     Set up the ChromaDB database. If force_reload is True or the database doesn't exist,
     load documents, create embeddings, and save to disk.
     """
+    global _current_pdf
+    
     # If database exists and we don't want to force reload, we can just load it
-    if os.path.exists(persist_directory) and not force_reload:
+    if os.path.exists(persist_directory) and not force_reload and pdf_path == _current_pdf:
         print("Loading existing ChromaDB...")
         embedder = HuggingFaceEmbeddings()
         db = Chroma(persist_directory=persist_directory, embedding_function=embedder)
@@ -46,6 +56,7 @@ def setup_db(force_reload=False):
         embedding=embedder,
         persist_directory=persist_directory
     )
+    _current_pdf = pdf_path
     print(f"ChromaDB created with {len(documents)} chunks and saved to {persist_directory}")
     return db
 
@@ -59,9 +70,8 @@ def create_rag_chain(db):
     
     # Create prompt template
     prompt_template = """
-    I will give you a snippet of code, using that and the pieces of context you're given, you are to 
-    give the code a score from 1 to 10, depending on vulnerability where 1 is least vulnerable and 
-    10 is most vulnerable.
+    Answer the following question based on the provided context. If the answer cannot be found in the context,
+    say "I cannot answer this based on the provided context."
     
     Context: {context}
     
@@ -85,75 +95,57 @@ def create_rag_chain(db):
     
     return rag_chain, retriever
 
-def initialize_system(force_reload=False):
+def initialize_system(pdf_path, force_reload=False):
     """Initialize the RAG system and store the chain and retriever globally"""
     global _rag_chain, _retriever
     
     # Set up the database
-    vector_db = setup_db(force_reload=force_reload)
+    vector_db = setup_db(pdf_path, force_reload=force_reload)
     
     # Create and store the RAG chain and retriever
     _rag_chain, _retriever = create_rag_chain(vector_db)
     
     return {"status": "System initialized successfully"}
 
-def query_answer(query):
-    """Run a query and return the result"""
-    global _rag_chain, _retriever
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
     
-    # Check if the system is initialized
-    if _rag_chain is None or _retriever is None:
-        initialize_system()
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
     
-    # Get the retrieved documents
-    retrieved_docs = _retriever.invoke(query)
+    if not file.filename.endswith('.pdf'):
+        return jsonify({'error': 'Only PDF files are allowed'}), 400
     
-    # Run the query through the RAG chain
-    result = _rag_chain.invoke(query)
+    # Save the file
+    filename = os.path.join(UPLOAD_FOLDER, file.filename)
+    file.save(filename)
     
-    return {"result": result}
+    try:
+        # Initialize the system with the new PDF
+        initialize_system(filename, force_reload=True)
+        return jsonify({'message': 'File uploaded and processed successfully'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-# Example usage
-if __name__ == "__main__":
-    # Initialize the system (only needs to be done once)
-    initialize_system(force_reload=False)
+@app.route('/query', methods=['POST'])
+def query():
+    data = request.json
+    if not data or 'query' not in data:
+        return jsonify({'error': 'No query provided'}), 400
     
-    vulnerable_code = """
-        #include <stdio.h>
-        #include <string.h>
-        #include <stdlib.h>
+    try:
+        # Check if the system is initialized
+        if _rag_chain is None or _retriever is None:
+            return jsonify({'error': 'System not initialized. Please upload a PDF first.'}), 400
+        
+        # Run the query through the RAG chain
+        result = _rag_chain.invoke(data['query'])
+        return jsonify({'response': result})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-        void process_input(char *input) {
-            char buffer[64];
-            // Buffer overflow vulnerability
-            strcpy(buffer, input);
-            
-            printf("Processing: %s\n", buffer);
-            
-            // Command injection vulnerability
-            char cmd[100];
-            sprintf(cmd, "echo %s", buffer);
-            system(cmd);
-            
-            // Memory leak
-            char *data = malloc(256);
-            strcpy(data, "Sensitive information");
-            // Missing free(data)
-        }
-
-        int main(int argc, char *argv[]) {
-            if (argc < 2) {
-                printf("Usage: %s <input>\n", argv[0]);
-                return 1;
-            }
-            
-            // No input validation
-            process_input(argv[1]);
-            
-            return 0;
-        }
-    """
-    
-    # Just pass the query, no need for other parameters
-    response = query_answer(vulnerable_code)
-    print(response)
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
